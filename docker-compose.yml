@@ -1,0 +1,278 @@
+version: '3.9'
+volumes:
+  pg_data:
+#    driver: local
+#    driver_opts:
+#      o: bind
+#      type: none
+#      device: ./docker_data/postgres/data
+
+services:
+  caddy:
+    hostname: caddy
+    container_name: jedai-caddy
+    build:
+      context: ./docker_definitions/caddy
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker_definitions/caddy/configs/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docker_data/caddy/data:/data
+      - ./docker_data/caddy/config:/config
+      - ./docker_data/caddy/logs:/var/log/caddy
+    depends_on:
+      - postgres
+#      - fastapi
+#      - n8n
+
+  postgres:
+    hostname: postgres
+    container_name: jedai-postgres
+    build:
+      context: ./docker_definitions/postgres
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jedai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supersecret}
+      POSTGRES_DB: ${POSTGRES_DB:-jedai_db}
+      GENERIC_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+    volumes:
+      - ./docker_definitions/postgres/configs/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./docker_definitions/postgres/init:/docker-entrypoint-initdb.d
+      - ./docker_data/postgres/logs:/var/log/postgresql:rw
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # n8n workflow engine
+  n8n:
+    hostname: n8n
+    container_name: jedai-n8n
+    build:
+      context: ./docker_definitions/n8n
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - DB_TYPE=postgresdb #${N8N_DB_TYPE:-postgresdb}
+      - DB_POSTGRESDB_HOST=postgres #${POSTGRESDB_HOST:-jedai}
+#      - DB_POSTGRESDB_PORT=${POSTGRES_PORT:-5432}
+      - DB_POSTGRESDB_DATABASE=jedai #${POSTGRES_DB:-jedai}
+      - DB_POSTGRESDB_USER=jedai #${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=@101dbreYRI101 # ${POSTGRES_PASSWORD}
+
+      - N8N_HOST=${N8N_HOST:-0.0.0.0}
+      - N8N_PORT=5678
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE:-false}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=${N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS:-false}
+
+      - GENERIC_TIMEZONE=${TZ}
+      - TZ=${TZ}
+    ports:
+      - "5678:5678"
+    volumes:
+      - ./docker_data/n8n/data/home:/home/node/.n8n
+      - ./docker_data/n8n/data/workflows:/home/node/.n8n/workflows:ro
+    depends_on:
+      - postgres
+
+
+  # yt-dlp (helper, can be invoked by n8n exec nodes)
+  ytdlp:
+    image: ghcr.io/yt-dlp/yt-dlp:latest
+    container_name: jedai-ytdlp
+    entrypoint: ["sleep","infinity"]
+    volumes:
+      - ./videos:/data/videos
+      - ./downloads-cache:/data/cache
+
+  # FastAPI gateway + Celery workers (build from fastapi/)
+  fastapi:
+    build: ./fastapi
+    container_name: jedai-fastapi
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./fastapi:/app
+      - ./audio:/app/audio
+      - ./transcripts:/app/transcripts
+      - ${VIDEOS_PATH}:/app/videos
+    depends_on:
+      - vllm
+      - qdrant
+      - whisperx
+      - fasterwhisper
+      - redis
+
+  celery:
+    build: ./fastapi
+    container_name: jedai-celery
+    command: celery -A tasks worker --loglevel=INFO
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./fastapi:/app
+      - ${VIDEOS_PATH}:/app/videos
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7
+    container_name: jedai-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+    # vLLM inference
+  vllm:
+    image: vllm/vllm:latest
+    container_name: jedai-vllm
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./models/vllm:/models
+    environment:
+      - VLLM_MODEL=${VLLM_MODEL}
+
+  # Qdrant vector DB
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: jedai-qdrant
+    restart: unless-stopped
+    ports:
+    - "6333:6333"
+    volumes:
+    - ./qdrant_storage:/qdrant/storage
+
+  # WhisperX (accurate batch)
+  whisperx:
+    image: ghcr.io/m-bain/whisperx:latest
+    container_name: jedai-whisperx
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./audio:/audio
+      - ./transcripts:/transcripts
+
+  # Faster-Whisper (low-latency)
+  fasterwhisper:
+    image: ghcr.io/guillaumekln/faster-whisper:latest
+    container_name: jedai-fasterwhisper
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./audio:/audio
+      - ./transcripts:/transcripts
+
+  # Florence-2 adapter (vision analysis)
+  florence2:
+    image: ghcr.io/your-org/florence2-server:latest
+    container_name: jedai-florence2
+    restart: unless-stopped
+    ports:
+      - "5003:5003"
+    volumes:
+      - ./models/florence2:/models
+
+  # ComfyUI for image/video generation
+  comfyui:
+    image: comfyanonymous/comfyui:latest
+    container_name: jedai-comfyui
+    restart: unless-stopped
+    ports:
+      - "8188:8188"
+    volumes:
+      - ./comfyui_models:/root/ComfyUI/models
+      - ./comfyui_output:/root/ComfyUI/output
+
+  # Stable Diffusion (A1111) optional
+  a1111:
+    image: automatic1111/stable-diffusion-webui:latest
+    container_name: jedai-a1111
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./sd_models:/data/models
+      - ./sd_outputs:/data/outputs
+
+  # GlusterFS client placeholder - expect host mount or gluster setup
+  gluster-client:
+    image: alpine:latest
+    container_name: jedai-gluster-client
+    privileged: true
+    command: ["sleep","infinity"]
+    volumes:
+      - ${GLUSTER_MOUNT_PATH}:/data/videos
+
+  # GlitchTip (Sentry alternative)
+  glitchtip:
+    image: glitchtip/glitchtip:latest
+    container_name: jedai-glitchtip
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - SECRET_KEY=${GLITCHTIP_SECRET}
+    volumes:
+      - ./glitchtip_data:/data
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: jedai-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  # Loki + Promtail
+  loki:
+    image: grafana/loki:2.8.2
+    container_name: jedai-loki
+    restart: unless-stopped
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:2.8.2
+    container_name: jedai-promtail
+    restart: unless-stopped
+    volumes:
+      - /var/log:/var/log
+      - ./promtail/promtail-config.yaml:/etc/promtail/promtail.yaml:ro
+
+  grafana:
+    image: grafana/grafana:9.5.2
+    container_name: jedai-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+

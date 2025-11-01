@@ -1,0 +1,20 @@
+# Caddy reverse proxy
+# Replace example.com with your domain
+api.jedai.example.com {
+	reverse_proxy / n8n:5678
+}
+
+
+fastapi.jedai.example.com {
+	reverse_proxy fastapi:8000
+}
+
+
+qdrant.jedai.example.com {
+	reverse_proxy qdrant:6333
+}
+
+
+pwa.jedai.example.com {
+	reverse_proxy pwa:8080
+}
